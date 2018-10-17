@@ -44,6 +44,7 @@ Street, Fifth Floor, Boston, MA 02110-1301, USA
 
 // viso, need for EstimateEgomotion
 #include "../libviso2/viso_stereo.h"
+#include "../libviso2/viso_mono.h"
 
 // Forward declarations
 namespace GOT { namespace segmentation { class ObjectProposal; } }
@@ -56,6 +57,7 @@ namespace GOT {
                */
             Eigen::Matrix4d EstimateEgomotion(libviso2::VisualOdometryStereo &viso, const cv::Mat &color_left, const cv::Mat &color_right);
 
+            Eigen::Matrix4d EstimateEgomotionMono(libviso2::VisualOdometryMono &viso, const cv::Mat &color_left);
             /**
                * @brief Given 3D pos., current-frame camera and past-state camera, gives you 'projected' egomotion vector
                */

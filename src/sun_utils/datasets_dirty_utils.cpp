@@ -213,7 +213,7 @@ namespace SUN {
 
             DatasetAssitantDirty::DatasetAssitantDirty(const po::variables_map &config_variables_map) {
                 this->variables_map_ = config_variables_map;
-                stereo_baseline_ = -1;
+                //stereo_baseline_ = -1;
             }
 
             bool DatasetAssitantDirty::RequestDisparity(int frame, bool save_if_not_avalible) {
@@ -298,55 +298,25 @@ namespace SUN {
                 }
 
                 /// Init camera and ground-model
-                left_camera_.init(calibration.GetProjCam2(), Eigen::Matrix4d::Identity(), left_image_.cols, left_image_.rows);
-                right_camera_.init(calibration.GetProjCam3(), Eigen::Matrix4d::Identity(), left_image_.cols, left_image_.rows);
-                stereo_baseline_ = calibration.b();
+                left_camera_.init(calibration.GetProjCam2(), Eigen::Matrix4d::Identity(),
+                        left_image_.cols, left_image_.rows);
 
                 // -------------------------------------------------------------------------------
                 // +++ OPTIONAL STUFF +++
                 // -------------------------------------------------------------------------------
 
-                /// Right image
-                if (this->variables_map_.count("right_image_path")) {
-                    char right_image_path_buff[MAX_PATH_LEN];
-                    snprintf(right_image_path_buff, MAX_PATH_LEN, this->variables_map_["right_image_path"].as<std::string>().c_str(), current_frame);
-                    right_image_ = cv::imread(right_image_path_buff, CV_LOAD_IMAGE_COLOR);
 
-                    if (right_image_.data == nullptr) {
-                        printf("DatasetAssitantDirty error: could not load image: %s\r\n", left_image_path_buff);
-                        return false;
-                    }
-                }
 
                 /// Disparity map
                 pcl::PointCloud<pcl::PointXYZRGBA>::Ptr point_cloud_ptr = nullptr;
-                if (this->variables_map_.count("left_disparity_path")) {
 
-                    if (!(this->RequestDisparity(current_frame, true))) {
-                        printf("DatasetAssitantDirty error: RequestDisparity failed!\r\n");
-                        return false;
-                    }
-
-                    char left_disparity_map_buff[MAX_PATH_LEN];
-                    snprintf(left_disparity_map_buff, MAX_PATH_LEN, this->variables_map_["left_disparity_path"].as<std::string>().c_str(), current_frame);
-
-                    disparity_map_.Read(left_disparity_map_buff);
-
-                    if (disparity_map_.mat().data == nullptr) {
-                        printf("DatasetAssitantDirty error: could not load disparity map: %s\r\n", left_disparity_map_buff);
-                        return false;
-                    }
-
-                    /// Compute point cloud. Note, that this point cloud is in camera space (current frame).
-                    left_point_cloud_.reset(new pcl::PointCloud<pcl::PointXYZRGBA>);
-                    Eigen::Matrix<double, 4, 4> identity_matrix_4 = Eigen::MatrixXd::Identity(4, 4);
-                    SUN::utils::pointcloud::ConvertDisparityMapToPointCloud(disparity_map_.mat(), left_image_,
-                                                                            calibration.c_u(), calibration.c_v(), calibration.f(), calibration.b(),
-                                                                            Eigen::Matrix4d::Identity(), true, left_point_cloud_);
-                    point_cloud_ptr = left_point_cloud_;
-                }
-
-
+                /// Compute point cloud. Note, that this point cloud is in camera space (current frame).
+                left_point_cloud_.reset(new pcl::PointCloud<pcl::PointXYZRGBA>);
+                Eigen::Matrix<double, 4, 4> identity_matrix_4 = Eigen::MatrixXd::Identity(4, 4);
+                SUN::utils::pointcloud::ConvertDisparityMapToPointCloud(disparity_map_.mat(), left_image_,
+                                                                        calibration.c_u(), calibration.c_v(), calibration.f(), calibration.b(),
+                                                                        Eigen::Matrix4d::Identity(), true, left_point_cloud_);
+                point_cloud_ptr = left_point_cloud_;
 
                 /// Load whole-sequence detections, but only once!
                 if (this->variables_map_.count("detections_path")) {
@@ -357,53 +327,21 @@ namespace SUN {
                     }
                 }
 
-                /// LiDAR
-                // Note: If velodyne scan is missing, don't return false. There are some velodyne scans actually missing in the dataset.
-                if (this->variables_map_.count("velodyne_path")) {
-                    char velodyne_buff[500];
-                    snprintf(velodyne_buff, MAX_PATH_LEN, this->variables_map_["velodyne_path"].as<std::string>().c_str(), current_frame);
-                    auto velodyne_cloud = SUN::utils::IO::ReadLaserPointCloud(std::string(velodyne_buff));
-                    if (velodyne_cloud!=nullptr) {
-                        // There are actually some velodyne scans missing ... ignore those.
-                        Eigen::Matrix4d Tr_cam0_cam2 = calibration.GetTr_cam0_cam2(); // Translation cam0 -> cam2
-                        Eigen::Matrix<double, 4, 4> Tr_laser_cam2 = Tr_cam0_cam2 * calibration.getR_rect() * calibration.getTr_velo_cam();
-                        left_point_cloud_velodyne_ = SUN::utils::pointcloud::RawLiDARCloudToImageAlignedAndOrganized(velodyne_cloud, Tr_laser_cam2, left_image_, left_camera_);
-                    }
-
-                    point_cloud_ptr = left_point_cloud_velodyne_;
-                }
-
-
                 /// Ground-plane
-                bool got_gp = false;
                 std::shared_ptr<SUN::utils::PlanarGroundModel> planar_ground_model(new SUN::utils::PlanarGroundModel);
 
-                if (this->variables_map_.count("ground_plane_path")) {
-                    char ground_plane_buff[MAX_PATH_LEN];
-                    snprintf(ground_plane_buff, MAX_PATH_LEN, this->variables_map_["ground_plane_path"].as<std::string>().c_str(), current_frame);
-                    Eigen::MatrixXd gp_tmp;
-                    if (SUN::utils::IO::ReadEigenMatrixFromTXT(ground_plane_buff, gp_tmp)) {
-                        ground_plane_ = gp_tmp.row(0).head<4>();
-                        planar_ground_model->set_plane_params(ground_plane_);
-                        got_gp = true;
-                    }
-                }
+                printf ("Fitting plane of-the-fly ...\r\n");
+                planar_ground_model->FitModel(point_cloud_ptr, 1.4);
+                // TODO: check if fitting was successful!
 
-                if (!got_gp) {
-                    // Fit plane
-                    printf ("Could not load ground-plane parameters, fitting plane of-the-fly ...\r\n");
-                    planar_ground_model->FitModel(point_cloud_ptr, 1.4);
-                    // TODO: check if fitting was successful!
-                }
 
                 /// Link it to the camera obj's
                 left_camera_.set_ground_model(planar_ground_model);
-                right_camera_.set_ground_model(planar_ground_model);
 
-                /// Detections
+
+                // Detections
                 if (this->variables_map_.count("detections_path")) {
                     object_detections_ = GetDetectionsKITTI(current_frame, left_camera_, right_camera_, variables_map_, this->kitti_detections_full_sequence_);
-                    // object_detections_ = GetDetections3DOP(current_frame, left_camera_, calibration, variables_map_);
                 }
 
                 /// Velocity estimates (from scene-flow)

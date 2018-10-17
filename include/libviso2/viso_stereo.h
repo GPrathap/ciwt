@@ -44,7 +44,7 @@ namespace libviso2 {
         };
 
         // constructor, takes as inpute a parameter structure
-        VisualOdometryStereo(parameters param);
+        explicit VisualOdometryStereo(parameters param);
 
         // deconstructor
         ~VisualOdometryStereo();

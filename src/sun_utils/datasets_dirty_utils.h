@@ -91,7 +91,6 @@ namespace SUN {
                 cv::Mat velocity_map_;
                 SUN::utils::Camera left_camera_;
                 SUN::utils::Camera right_camera_;
-                double stereo_baseline_;
                 std::vector<SUN::utils::Detection> object_detections_;
                 std::vector<SUN::utils::KITTI::TrackingLabel> kitti_detections_full_sequence_;
                 Eigen::Vector4d ground_plane_;

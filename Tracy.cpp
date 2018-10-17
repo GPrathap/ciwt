@@ -19,7 +19,9 @@ rwth_mot framework; if not, write to the Free Software Foundation, Inc., 51 Fran
 Street, Fifth Floor, Boston, MA 02110-1301, USA
 */
 
+#include <viso_mono.h>
 #include "Tracy.h"
+
 
 namespace po = boost::program_options;
 
@@ -174,7 +176,7 @@ namespace tracy {
                     ("show_visualization_3d", po::bool_switch(&show_visualization_3d)->default_value(false), "Show 3D visualization.")
                     ("show_visualization_2d", po::bool_switch(&show_visualization_2d)->default_value(false), "Show 2D visualization.")
                     ("run_tracker", po::value<bool>(&run_tracker)->default_value(true), "Should run tracker, or should not?")
-                    ("debug_level", po::value<int>(&debug_level)->default_value(0), "Debug level")
+                    ("debug_level", po::value<int>(&debug_level)->default_value(1), "Debug level")
                     ;
 
             // General app options (can be spec. in config or via cmd args)
@@ -276,15 +278,12 @@ namespace tracy {
 
                 if (save_if_not_avalible) {
                     std::cout << "Saving proposals to: " << proposal_path_buff << std::endl;
-
                     boost::filesystem::path prop_path(proposal_path_buff);
                     boost::filesystem::path prop_dir = prop_path.parent_path();
                     SUN::utils::IO::MakeDir(prop_dir.c_str());
-
                     GOT::segmentation::utils::SaveObjectProposals(proposal_path_buff, proposals_out);
                 }
             }
-
             return true;
         }
 
@@ -295,9 +294,237 @@ namespace tracy {
     {
         try
         {
-            //cv::imshow("view", cv_bridge::toCvShare(msg, "bgr8")->image);
-            //std::cout<<"image is received"<<std::endl;
-            //cv::waitKey(30);
+//            std::cout<<"Current Frame"<< current_frame << std::endl;
+            cv::Mat current_image = cv_bridge::toCvShare(msg, "bgr8")->image;
+//            cv::imshow("view", cv_bridge::toCvShare(msg, "bgr8")->image);
+//            std::cout<<"image is received"<<std::endl;
+//            cv::waitKey(30);
+            if(Tracy::debug_level>0){
+                std::cout << "\33[33;40;1m" << "-----------------------------------------------------------------------------" << "\33[0m" << std::endl;
+                std::cout << "\33[33;40;1m" <<"                                            Processing frame " << current_frame << "\33[0m"<< std::endl;
+                std::cout << "\33[33;40;1m" << "-----------------------------------------------------------------------------" << "\33[0m" << std::endl;
+            }
+
+
+            // -------------------------------------------------------------------------------
+            // +++ Load data +++
+            // -------------------------------------------------------------------------------
+            std::cout<<"adding--------->"<<std::endl;
+            camera_depth_estimator.getDisparityMap(current_image, &dataset_assistant->disparity_map_.mat());
+            if (!dataset_assistant->LoadData(current_frame, variables_map["dataset_name"].as<std::string>())) {
+                printf("Dataset assistant can't load data :'( Check your config. \r\n");
+            }
+            std::cout<<"--------1------>"<<std::endl;
+
+            auto &left_camera = dataset_assistant->left_camera_;
+            //auto &right_camera = dataset_assistant->right_camera_;
+            const auto &left_image = dataset_assistant->left_image_;
+            const auto &planar_ground_model = left_camera.ground_model();
+            const auto &velocity_map = dataset_assistant->velocity_map_;
+            left_point_cloud_preprocessed.reset(new PointCloudRGBA);
+            pcl::copyPointCloud(*dataset_assistant->left_point_cloud_, *left_point_cloud_preprocessed);
+            std::vector<SUN::utils::Detection> detections_current_frame = dataset_assistant->object_detections_;
+            std::cout<<"--------2------>"<<std::endl;
+
+            // -------------------------------------------------------------------------------
+            // +++ Run visual odometry module => estimate egomotion +++
+            // -------------------------------------------------------------------------------
+
+            std::cout<<"--------3------>"<<std::endl;
+            // Estimate ego
+            InitVO(vo_module, left_camera.f_u(), left_camera.c_u(), left_camera.c_v()); // Will be only initialized once, but need to do it within the loop
+            Eigen::Matrix4d ego_this_frame = GOT::tracking::utils::EstimateEgomotionMono(*vo_module, dataset_assistant->left_image_);
+            std::cout<<"--------4------>"<<std::endl;
+            // Accumulated transformation
+            egomotion = egomotion * ego_this_frame.inverse();
+            std::cout<<"--------5------>"<<std::endl;
+            // Update left_camera, right_camera using estimated pose transform
+            left_camera.ApplyPoseTransform(egomotion);
+            std::cout<<"--------6------>"<<std::endl;
+            // -------------------------------------------------------------------------------
+            // +++ 3D proposals +++
+            // -------------------------------------------------------------------------------
+
+            if(debug_level>0) printf("->Processing object proposals ...\r\n");
+            bool success_loading_proposals = false;
+//            if (tracking_mode_str == "detection_shape")  { // In detection-only mode, don't bother with proposals
+//                success_loading_proposals = RequestObjectProposals(current_frame, variables_map,
+//                                                                            std::bind(GOT::segmentation::proposal_generation::ComputeSuppressedMultiScale3DProposals,
+//                                                                                      dataset_assistant->left_point_cloud_, dataset_assistant->left_camera_, std::placeholders::_1),
+//                                                                            object_proposals_all);
+//
+//                assert(success_loading_proposals);
+//            }
+
+            // Filter certain 'noise' proposals (reject small ones and flying-ones)
+            object_proposals_all = GOT::segmentation::utils::FilterProposals(object_proposals_all, left_camera, variables_map);
+
+            // Sort (or: Re-Sort) proposals by their score.
+            std::sort(object_proposals_all.begin(), object_proposals_all.end(),
+                      [](const GOT::segmentation::ObjectProposal &i, const GOT::segmentation::ObjectProposal &j) { return i.score() > j.score(); });
+
+            if(debug_level>0) printf("->Got %d proposals.\r\n", static_cast<int>(object_proposals_all.size()));
+
+            // Start per-frame timing analysis here!
+            std::chrono::steady_clock::time_point time_begin = std::chrono::steady_clock::now();
+
+            if(debug_level>0) printf("->Observation fusion ...\r\n");
+
+            std::vector<GOT::tracking::Observation> observations_all;
+            const auto &proposal_set_to_use = object_proposals_all;
+
+            if (tracking_mode_str=="detection") {
+                /// Baseline: use only what can be inferred from detection bounding-boxes (faster, less accurate in 3D).
+                auto det_obs_fnc = GOT::tracking::observation_processing::DetectionsOnly;
+                observations_all = det_obs_fnc(detections_current_frame, proposal_set_to_use, left_image);
+            }
+            else if (tracking_mode_str=="detection_shape") {
+                /// Do proposal<->detection association using CRF, for precise detection localization.
+                observations_all = GOT::tracking::observation_processing::DetectionToSegmentationFusion(
+                        detections_current_frame, proposal_set_to_use,
+                        left_camera, left_image, variables_map
+                );
+            }
+            else {
+                std::cout << "Unknown tracking_mode: " + tracking_mode_str + "." << std::endl;
+            }
+
+            // -------------------------------------------------------------------------------
+            // +++ Re-compute pos. cov. matrices +++
+            // -------------------------------------------------------------------------------
+            // Add some (learned) 'bias' to covariance matrices, depending on wheter it was localized with an 3D segment or by footpoint-projection.
+            /*if(debug_level>0) printf("->Override cov-mats ...\r\n");
+            for (auto &obs:observations_all) {
+                Eigen::Matrix3d cov_out;
+                left_camera.ComputeMeasurementCovariance3d(obs.footpoint().head<3>(), 0.5, left_camera.P().block(0,0,3,4),
+                        left_camera.P().block(0,0,3,4), cov_out);
+
+                double add_unc_x = 0.0;
+                double add_unc_z = 0.0;
+                if (obs.proposal_3d_avalible()) {
+                    add_unc_x = variables_map["pos_unc_seg_x"].as<double>();
+                    add_unc_z = variables_map["pos_unc_seg_z"].as<double>();
+                } else {
+                    add_unc_x = variables_map["pos_unc_det_x"].as<double>();
+                    add_unc_z = variables_map["pos_unc_det_z"].as<double>();
+                }
+
+                cov_out(0, 0) += add_unc_x;
+                cov_out(2, 2) += add_unc_z;
+                obs.set_covariance3d(cov_out);
+            }*/
+            // -------------------------------------------------------------------------------
+            // +++ Compute velocity for segments +++
+            // -------------------------------------------------------------------------------
+            if (dataset_assistant->velocity_map_.data!=nullptr) {
+
+                // If velocity map is provided, we can compute velocities for fused observations
+                if(debug_level>0) printf("->Compute segment velocities ...\r\n");
+
+                for (auto &obs:observations_all) {
+                    if (obs.proposal_3d_avalible()) {
+                        Eigen::Vector3d obs_velocity = SUN::utils::observations::ComputeVelocity(velocity_map, obs.pointcloud_indices(),
+                                                                                                 variables_map["dt"].as<double>());
+                        obs.set_velocity(obs_velocity);
+                    }
+                }
+            }
+
+            const int max_num_observations_for_tracker = variables_map["max_num_input_observations"].as<int>();
+            const int num_best_observations_to_consider = std::min(max_num_observations_for_tracker,
+                    static_cast<int>(observations_all.size()));
+            auto observations_to_pass_to_tracker = observations_all;
+
+            // -------------------------------------------------------------------------------
+            // +++ Tracking +++
+            // -------------------------------------------------------------------------------
+            /// Feed the resource manager with current-frame data
+            resource_manager->AddNewMeasurements(current_frame, left_point_cloud_preprocessed, left_camera);
+            resource_manager->AddNewObservations(observations_to_pass_to_tracker);
+
+            /// Invoke the tracker
+            if (run_tracker) {
+                if(debug_level>0) printf("->Running the tracker (observations: %d) ...\r\n", (int)observations_to_pass_to_tracker.size());
+                multi_object_tracker->ProcessFrame(resource_manager, current_frame);
+            }
+
+            // Timing analysis
+            std::chrono::steady_clock::time_point time_end = std::chrono::steady_clock::now();
+            total_processing_time += std::chrono::duration_cast<std::chrono::milliseconds>(time_end - time_begin).count();
+
+            auto hypos_to_process_further = multi_object_tracker->selected_hypotheses(); // Selected hypothesis set.
+            auto hypos_terminated = multi_object_tracker->terminated_hypotheses(); // Terminated, but still active, set.
+
+
+            /// Export tracking data to labels struct (need for results export)
+            GOT::tracking::utils::HypothesisSetToLabels(current_frame, hypos_to_process_further, tracker_result_labels,
+                                                        std::bind(GOT::tracking::utils::HypoToLabelDefault, std::placeholders::_1, std::placeholders::_2,
+                                                                  left_camera.width(), left_camera.height()));
+
+            // -------------------------------------------------------------------------------
+            // +++ Visualizations (image) +++
+            // -------------------------------------------------------------------------------
+
+            /// Draw observations and tracked objects
+            cv::Mat left_image_with_observations = left_image.clone();
+            cv::Mat left_image_with_hypos_2d = left_image.clone();
+            cv::Mat left_image_with_detections = left_image.clone();
+
+            if (debug_level>=2 || show_visualization_2d) {
+                tracking_visualizer.DrawObservations(observations_all, left_image_with_observations, left_camera,
+                        GOT::tracking::draw_observations::DrawObservationAndOrientation);
+                tracking_visualizer.DrawHypotheses(hypos_to_process_further, left_camera, left_image_with_hypos_2d,
+                        GOT::tracking::draw_hypos::DrawHypothesis2d);
+            }
+
+            if (show_visualization_2d) {
+                cv::imshow("tracking_2d_window", left_image_with_hypos_2d);
+                cv::imshow("observations_id_window", left_image_with_observations);
+            }
+
+            /// Save to the disk
+            if (debug_level>=2) {
+                char frame_str_buff[50];
+                snprintf(frame_str_buff, 50, (sequence_name + "_%06d").c_str(), current_frame);
+                char output_path_buff[500];
+
+                if (run_tracker) {
+                    // Tracking 2D visualization
+                    snprintf(output_path_buff, 500, "%s/hypos_2d_%s.png", output_dir_visual_results.c_str(), frame_str_buff);
+                    cv::imwrite(output_path_buff, left_image_with_hypos_2d);
+                }
+            }
+
+            // -------------------------------------------------------------------------------
+            // +++ Update the state for the 3D visualizer thread +++
+            // -------------------------------------------------------------------------------
+
+            if (show_visualization_3d) {
+
+                boost::mutex::scoped_lock updateLock(visualization_3d_update_mutex);
+                visualization_3d_update_flag = true;
+
+                pcl::copyPointCloud(*dataset_assistant->left_point_cloud_, *visualization_3d_point_cloud);
+                visualization_3d_point_cloud->sensor_origin_ = Eigen::Vector4f(0.0,0.0,0.0,1.0);
+                visualization_observations = observations_all;
+                visualization_3d_proposals = proposal_set_to_use;
+
+                char frame_str_buff[50];
+
+
+                snprintf(frame_str_buff, 50, (sequence_name).c_str());
+                char buff[500];
+                snprintf(buff, 500, "%s/3d_viewer_%s_%06d.png", output_dir_visual_results.c_str(), frame_str_buff, current_frame);
+                viewer_3D_output_path = std::string(buff);
+
+                visualization_3d_tracking_hypotheses = hypos_to_process_further;
+                visualization_3d_tracking_terminated_hypotheses = hypos_terminated;
+                visualization_3d_left_camera = left_camera;
+
+                updateLock.unlock();
+            }
+
+            current_frame+=1;
 
         }
         catch (cv_bridge::Exception& e)
@@ -323,50 +550,11 @@ namespace tracy {
 int main(const int argc, const char** argv) {
 
 
-    // -------------------------------------------------------------------------------
-    // +++ MAIN TRACKING LOOP +++
-    // -------------------------------------------------------------------------------
-    double total_processing_time = 0.0;
+
     for (int current_frame=CIWTApp::start_frame; current_frame<=CIWTApp::end_frame; current_frame++) {
 
-        if(CIWTApp::debug_level>0){
-            std::cout << "\33[33;40;1m" << "-----------------------------------------------------------------------------" << "\33[0m" << std::endl;
-            std::cout << "\33[33;40;1m" <<"                                            Processing frame " << current_frame << "\33[0m"<< std::endl;
-            std::cout << "\33[33;40;1m" << "-----------------------------------------------------------------------------" << "\33[0m" << std::endl;
-        }
 
-        // -------------------------------------------------------------------------------
-        // +++ Load data +++
-        // -------------------------------------------------------------------------------
 
-        if (!dataset_assistant.LoadData(current_frame, variables_map["dataset_name"].as<std::string>())) {
-            printf("Dataset assistant can't load data :'( Check your config. \r\n");
-            return -1;
-        }
-
-        auto &left_camera = dataset_assistant.left_camera_;
-        auto &right_camera = dataset_assistant.right_camera_;
-        const auto &left_image = dataset_assistant.left_image_;
-        const auto &planar_ground_model = left_camera.ground_model();
-        const auto &velocity_map = dataset_assistant.velocity_map_;
-        left_point_cloud_preprocessed.reset(new PointCloudRGBA);
-        pcl::copyPointCloud(*dataset_assistant.left_point_cloud_, *left_point_cloud_preprocessed);
-        std::vector<SUN::utils::Detection> detections_current_frame = dataset_assistant.object_detections_;
-
-        // -------------------------------------------------------------------------------
-        // +++ Run visual odometry module => estimate egomotion +++
-        // -------------------------------------------------------------------------------
-
-        // Estimate ego
-        InitVO(vo_module, left_camera.f_u(), left_camera.c_u(), left_camera.c_v(), dataset_assistant.stereo_baseline_); // Will be only initialized once, but need to do it within the loop
-        Eigen::Matrix4d ego_this_frame = GOT::tracking::utils::EstimateEgomotion(*vo_module, dataset_assistant.left_image_, dataset_assistant.right_image_);
-
-        // Accumulated transformation
-        CIWTApp::egomotion = CIWTApp::egomotion * ego_this_frame.inverse();
-
-        // Update left_camera, right_camera using estimated pose transform
-        left_camera.ApplyPoseTransform(CIWTApp::egomotion);
-        right_camera.ApplyPoseTransform(CIWTApp::egomotion);
 
         // -------------------------------------------------------------------------------
         // +++ 3D proposals +++
@@ -579,15 +767,42 @@ using namespace tracy;
 
 int main(int argc, char** argv)
 {
-
     Tracy tracy;
     std::cout << "Hello from Tracy!" << std::endl;
+
+    tensorflow::string usage = tensorflow::Flags::Usage(argv[0], tracy.camera_depth_estimator.flag_list);
+    const bool parse_result = tensorflow::Flags::Parse(&argc, argv, tracy.camera_depth_estimator.flag_list);
+    typedef const boost::function< void(const sensor_msgs::ImageConstPtr &)>  callback;
+
+    if (!parse_result) {
+        LOG(ERROR) << usage;
+        return -1;
+    }
+
+    tensorflow::port::InitMain(argv[0], &argc, &argv);
+    if (argc > 1) {
+        LOG(ERROR) << "Unknown argument " << argv[1] << "\n" << usage;
+        return -1;
+    }
+
+    tracy.camera_depth_estimator.session = std::unique_ptr<tensorflow::Session>();
+
+    tensorflow::string graph_path = tensorflow::io::JoinPath(tracy.camera_depth_estimator.root_dir, tracy.camera_depth_estimator.graph);
+    tensorflow::Status load_graph_status = tracy.camera_depth_estimator.LoadGraph(graph_path, &tracy.camera_depth_estimator.session);
+    if (!load_graph_status.ok()) {
+        LOG(ERROR) << load_graph_status;
+        return -1;
+    }else{
+        std::cout<<"Graph loading is successful"<<std::endl;
+    }
+
+
 
     // -------------------------------------------------------------------------------
     // +++ Command Args Parser +++
     // -------------------------------------------------------------------------------
-    po::variables_map variables_map;
-    if (!tracy.ParseCommandArguments(argc, argv, variables_map)) {
+
+    if (!tracy.ParseCommandArguments(argc, argv, tracy.variables_map)) {
         std::cout << "Failed at ParseCommandArguments ... " << std::endl;
         return -1;
     }
@@ -609,50 +824,36 @@ int main(int argc, char** argv)
     // -------------------------------------------------------------------------------
     // +++ Create output dirs +++
     // -------------------------------------------------------------------------------
-    // You can add more output sub-dir's!
-    std::string output_dir_visual_results;
-    std::string output_dir_tracking_data;
+
     if (tracy.debug_level>=3) {
-        output_dir_visual_results = tracy.output_dir + "/visual_results";
-        bool make_dir_success = SUN::utils::IO::MakeDir(output_dir_visual_results.c_str());
+        tracy.output_dir_visual_results = tracy.output_dir + "/visual_results";
+        bool make_dir_success = SUN::utils::IO::MakeDir(tracy.output_dir_visual_results.c_str());
         assert(make_dir_success);
 
-        output_dir_tracking_data = tracy.output_dir + "/tracking_data";
-        make_dir_success = SUN::utils::IO::MakeDir(output_dir_tracking_data.c_str());
+        tracy.output_dir_tracking_data = tracy.output_dir + "/tracking_data";
+        make_dir_success = SUN::utils::IO::MakeDir(tracy.output_dir_tracking_data.c_str());
         assert(make_dir_success);
     }
 
     // -------------------------------------------------------------------------------
     // +++ Data handling +++
     // -------------------------------------------------------------------------------
-    SUN::utils::dirty::DatasetAssitantDirty dataset_assistant(variables_map); // Data loading hacky module
-    tracy::Tracy::PointCloudRGBA::Ptr left_point_cloud_preprocessed; // Preprocessed cloud
-    std::vector<GOT::segmentation::ObjectProposal> object_proposals_all; // 'Raw' object proposals set
+    tracy.dataset_assistant =  new SUN::utils::dirty::DatasetAssitantDirty(tracy.variables_map); // Data loading hacky module
     std::shared_ptr<GOT::tracking::Resources> resource_manager(
-            new GOT::tracking::Resources(variables_map["tracking_temporal_window_size"].as<int>()+1));
+            new GOT::tracking::Resources(tracy.variables_map["tracking_temporal_window_size"].as<int>()+1));
 
     // -------------------------------------------------------------------------------
     // +++ Visual odometry module +++
     // -------------------------------------------------------------------------------
-    std::shared_ptr<libviso2::VisualOdometryStereo> vo_module = nullptr;
 
-    auto InitVO = [](std::shared_ptr<libviso2::VisualOdometryStereo> &vo, double f, double c_u, double c_v, double baseline) {
-        if (vo==nullptr) {
-            libviso2::VisualOdometryStereo::parameters param;
-            param.calib.f = f;
-            param.calib.cu = c_u;
-            param.calib.cv = c_v;
-            param.base = baseline;
-            vo.reset(new libviso2::VisualOdometryStereo(param));
-        }
-    };
+
 
     // -------------------------------------------------------------------------------
     // +++ Tracker +++
     // -------------------------------------------------------------------------------
     // Create the tracker object
     std::unique_ptr<GOT::tracking::ciwt_tracker::CIWTTracker>
-            multi_object_tracker(new GOT::tracking::ciwt_tracker::CIWTTracker(variables_map));
+            multi_object_tracker(new GOT::tracking::ciwt_tracker::CIWTTracker(tracy.variables_map));
 
     if (tracy.debug_level>=3)
         multi_object_tracker->set_verbose(true);
@@ -665,9 +866,11 @@ int main(int argc, char** argv)
     tracy.visualization_3d_point_cloud.reset(new tracy::Tracy::PointCloudRGBA);
     std::unique_ptr<boost::thread> visualization_3d_thread;
     if (tracy.show_visualization_3d) {
-        visualization_3d_thread.reset(new boost::thread(boost::bind(&Tracy::VisualizeScene3D, &tracy)));
+        //visualization_3d_thread.reset(new boost::thread(boost::bind(&Tracy::VisualizeScene3D, &tracy)));
     }
 
+    tracy.multi_object_tracker = std::unique_ptr<GOT::tracking::ciwt_tracker::CIWTTracker>(new GOT::tracking::ciwt_tracker::CIWTTracker(tracy.variables_map));
+    tracy.resource_manager = std::shared_ptr<GOT::tracking::Resources>(new GOT::tracking::Resources(tracy.variables_map["tracking_temporal_window_size"].as<int>()+1));
     /// 2D visualization threads
     if (tracy.show_visualization_2d) {
         cv::namedWindow("tracking_2d_window");
@@ -682,8 +885,16 @@ int main(int argc, char** argv)
     ros::init(argc, argv, "image_subscriber_depth_estimator");
     ros::NodeHandle nh;
     ros::Subscriber sub_front;
+    image_transport::ImageTransport it(nh);
     callback boundImageCallback = boost::bind(&Tracy::imageCallback, &tracy, _1);
-    sub_front = nh.subscribe(tracy.front_camera, 1, boundImageCallback);
+    image_transport::Subscriber sub = it.subscribe(tracy.front_camera, 1, boundImageCallback);
+
+    // -------------------------------------------------------------------------------
+    // +++ MAIN TRACKING LOOP +++
+    // -------------------------------------------------------------------------------
+    double total_processing_time = 0.0;
+
+
     ros::spin();
     ROS_ERROR("Exit");
     return 0;

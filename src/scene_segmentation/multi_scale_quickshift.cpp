@@ -84,6 +84,40 @@ namespace GOT {
                 return final_proposal_set;
             }
 
+            std::vector<ObjectProposal>
+            ComputeSuppressedMultiScale3DProposalsMono(pcl::PointCloud<pcl::PointXYZRGBA>::ConstPtr input_cloud,
+                                                   const SUN::utils::Camera &left_camera,
+                                                   const po::variables_map &parameter_map) {
+
+                auto proposals_per_scale = ComputeMultiScale3DProposalsQuickShift(input_cloud, left_camera, parameter_map);
+
+                auto scale_overlap_thresh = parameter_map.at("clustering_scale_persistence_overlap_threshold").as<double>();
+                auto final_proposal_set = GOT::segmentation::utils::MultiScaleSuppression(proposals_per_scale, scale_overlap_thresh);
+
+                /// Compute covariance matrices
+                for (auto &proposal:final_proposal_set) {
+                    // TODO ...
+
+                    Eigen::Matrix3d cov_mat;
+                    cov_mat.setIdentity();
+//                    SUN::utils::observations::ComputePoseCovariance(input_cloud, proposal.pos3d(), proposal.pointcloud_indices(),
+//                                                                    left_camera.P().block(0,0,3,4),
+//                                                                    cov_mat);
+                    proposal.set_pose_covariance_matrix(cov_mat);
+                }
+
+
+                /// Normalize scale-persistance scores
+                int num_scale_spaces = parameter_map.at("clustering_num_scale_spaces").as<int>();
+                for (auto &proposal:final_proposal_set)
+                    proposal.set_score(static_cast<double>(proposal.scale_pairs().size()) / static_cast<double>(num_scale_spaces));
+
+                /// Sort according to the score!
+                std::sort(final_proposal_set.begin(), final_proposal_set.end(), [](const GOT::segmentation::ObjectProposal &i, const GOT::segmentation::ObjectProposal &j){ return i.score() > j.score(); });
+
+                return final_proposal_set;
+            }
+
             std::vector <std::vector<ObjectProposal>>
             ComputeMultiScale3DProposalsFloodfill(pcl::PointCloud<pcl::PointXYZRGBA>::ConstPtr input_cloud,
                                                    const SUN::utils::Camera &camera, const po::variables_map &parameter_map) {

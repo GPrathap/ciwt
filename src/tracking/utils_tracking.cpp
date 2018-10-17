@@ -23,6 +23,7 @@ Street, Fifth Floor, Boston, MA 02110-1301, USA
 
 // std
 #include <iostream>
+#include <viso_mono.h>
 
 // tracking
 #include "../../include/tracking/category_filter.h"
@@ -41,6 +42,7 @@ namespace GOT {
 
 
             Eigen::Matrix4d EstimateEgomotion(libviso2::VisualOdometryStereo &viso, const cv::Mat &color_left, const cv::Mat &color_right) {
+
                 cv::Mat grayscale_left, grayscale_right;
                 cv::cvtColor(color_left, grayscale_left, CV_BGR2GRAY);
                 cv::cvtColor(color_right, grayscale_right, CV_BGR2GRAY);
@@ -75,6 +77,42 @@ namespace GOT {
 
                 free(left_img_data);
                 free(right_img_data);
+                return egomotion_eigen;
+            }
+
+            Eigen::Matrix4d EstimateEgomotionMono(libviso2::VisualOdometryMono &viso, const cv::Mat &color_left) {
+
+                cv::Mat grayscale_left, grayscale_right;
+                cv::cvtColor(color_left, grayscale_left, CV_BGR2GRAY);
+                const int32_t width = color_left.cols;
+                const int32_t height = color_left.rows;
+
+                // Convert input images to uint8_t buffer
+                uint8_t* left_img_data  = (uint8_t*)malloc(width*height*sizeof(uint8_t));
+
+                int32_t k=0;
+                for (int32_t v=0; v<height; v++) {
+                    for (int32_t u=0; u<width; u++) {
+                        left_img_data[k]  = (uint8_t)grayscale_left.at<uchar>(v,u);
+                        k++;
+                    }
+                }
+
+                Eigen::Matrix<double,4,4> egomotion_eigen = Eigen::MatrixXd::Identity(4,4); // Current pose
+                int32_t dims[] = {width,height,width};
+                if (viso.process(left_img_data,dims)) {
+                    // on success, update current pose
+                    //std::vector<int32_t> inlier_indices = viso->getInlierIndices();
+                    // std::vector<libviso2::Matcher::p_match> matches = viso.getMatches();
+                    libviso2::Matrix frame_to_frame_motion = viso.getMotion(); //libviso2::Matrix::inv(viso->getMotion());
+                    for(size_t i=0; i<4; i++){
+                        for(size_t j=0; j<4; j++){
+                            egomotion_eigen(i,j) = frame_to_frame_motion.val[i][j];
+                        }
+                    }
+                }
+
+                free(left_img_data);
                 return egomotion_eigen;
             }
 

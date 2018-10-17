@@ -31,17 +31,21 @@ include_directories(${OpenCV_INCLUDE_DIRS})
 link_directories(${OpenCV_LIBRARY_DIRS})
 
 
-include_directories(${catkin_INCLUDE_DIRS})
+include_directories(${catkin_INCLUDE_DIRS} )
+#include_directories(${catkin_INCLUDE_DIRS} /root/catkin_ws/devel/include/)
 
 #set(VTK_DIR "/root/software/VTK-7.1.0/build")
 #find_package(VTK REQUIRED)
 #include(${VTK_USE_FILE})
+
+link_directories(/root/catkin_ws/devel/lib)
 
 set(${PROJECT_NAME}_LIB ${${PROJECT_NAME}_LIB} ${Boost_LIBRARIES})
 set(${PROJECT_NAME}_LIB ${${PROJECT_NAME}_LIB} ${PCL_LIBRARIES})
 #set(${PROJECT_NAME}_LIB ${${PROJECT_NAME}_LIB} ${VTK_LIBRARIES})
 set(${PROJECT_NAME}_LIB ${${PROJECT_NAME}_LIB} ${OpenCV_LIBRARIES})
 set(${PROJECT_NAME}_LIB ${${PROJECT_NAME}_LIB} ${catkin_LIBRARIES})
+set(${PROJECT_NAME}_LIB ${${PROJECT_NAME}_LIB} tensorflow)
 
 message(  "Include directories for ${PROJECT_NAME}:" ${${PROJECT_NAME}_Headers})
 message(  "Include directories for ${PROJECT_NAME}:"${PCL_LIBRARIES})
@@ -54,7 +58,7 @@ foreach( DIR  connected_components libelas libviso2 scene_segmentation tracking 
 endforeach()
 
 message( STATUS "Include sub-directories into build process:" )
-foreach( DIR CIWT connected_components external libelas libviso2 scene_segmentation sun_utils tracking )
+foreach( DIR CIWT connected_components external libelas libviso2 scene_segmentation sun_utils tracking depth_estimation)
     message( STATUS "  - include/" ${DIR} )
     include_directories( "src/${DIR}" )
     link_directories("src/${DIR}")
@@ -63,7 +67,8 @@ endforeach()
 
 add_subdirectory(src)
 
-set(${PROJECT_NAME}_LIB ${${PROJECT_NAME}_LIB} CIWT libelas libviso2  scene_segmentation  connected_components tracking sun_utils external)
+set(${PROJECT_NAME}_LIB ${${PROJECT_NAME}_LIB} CIWT libelas libviso2  scene_segmentation  connected_components tracking
+        sun_utils external depth_estimation)
 message( STATUS "Linked libries: " ${${PROJECT_NAME}_LIB} )
 
 set(${PROJECT_NAME}_LIB ${${PROJECT_NAME}_LIB} ${${PROJECT_NAME}_libraries})

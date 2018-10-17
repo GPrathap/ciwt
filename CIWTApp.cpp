@@ -445,7 +445,7 @@ int main(const int argc, const char** argv) {
     // -------------------------------------------------------------------------------
     std::shared_ptr<libviso2::VisualOdometryStereo> vo_module = nullptr;
 
-    auto InitVO = [](std::shared_ptr<libviso2::VisualOdometryStereo> &vo, double f, double c_u, double c_v, double baseline) {
+    auto InitVO = [](std::shared_ptr<libvisoegomotion2::VisualOdometryStereo> &vo, double f, double c_u, double c_v, double baseline) {
         if (vo==nullptr) {
             libviso2::VisualOdometryStereo::parameters param;
             param.calib.f = f;
